@@ -34,6 +34,10 @@ namespace sdb::pg {
 
 namespace {
 
+void ResolveEntity(ObjectId database, std::span<const std::string> search_path,
+                   Objects& objects, Disallowed& disallowed,
+                   const Objects& query, std::string_view entity_name);
+
 void ResolveObject(ObjectId database, std::span<const std::string> search_path,
                    Objects& objects, Disallowed& disallowed,
                    const Objects::ObjectName& name, Objects::ObjectData& data) {
@@ -100,6 +104,15 @@ void ResolveObject(ObjectId database, std::span<const std::string> search_path,
                       func.SqlFunction().GetObjects());
       changed = disallowed.erase(name) != 0;
       SDB_ASSERT(changed);
+    }
+  } else if (data.object->GetType() == catalog::ObjectType::Table) {
+    auto table = basics::downCast<catalog::Table>(*data.object);
+    for (const auto& column : table.Columns()) {
+      if (const auto& default_value = column.default_value) {
+        const auto& default_value_objects = default_value->GetObjects();
+        ResolveEntity(database, search_path, objects, disallowed,
+                      default_value_objects, "default_value");
+      }
     }
   }
 }
