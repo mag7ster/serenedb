@@ -1241,8 +1241,8 @@ void SqlAnalyzer::MakeTableWrite(
     for (const auto* column : generated_columns) {
       SDB_ASSERT(column);
       SDB_ASSERT(column->IsGenerated());
-      SDB_ASSERT(column->default_value);
-      auto expr = ProcessExprNodeImpl(state, column->default_value.GetExpr());
+      SDB_ASSERT(column->expr);
+      auto expr = ProcessExprNodeImpl(state, column->expr->GetExpr());
       column_names.emplace_back(column->name);
       column_exprs.emplace_back(std::move(expr));
     }
@@ -1364,16 +1364,15 @@ void SqlAnalyzer::ProcessInsertStmt(State& state, const InsertStmt& stmt) {
   std::vector<const catalog::Column*> generated_columns;
   for (const auto& column : table.Columns()) {
     if (!absl::c_linear_search(column_names, column.name)) {
-      const auto& default_value = column.default_value;
       if (column.IsGenerated()) {
-        SDB_ASSERT(default_value);
+        SDB_ASSERT(column.expr);
         generated_columns.emplace_back(&column);
         continue;
       }
 
       lp::ExprPtr expr;
-      if (default_value) {
-        expr = ProcessExprNodeImpl(state, default_value.GetExpr());
+      if (column.expr) {
+        expr = ProcessExprNodeImpl(state, column.expr->GetExpr());
       } else {
         expr = MakeConst(velox::TypeKind::UNKNOWN, column.type);
       }
@@ -1482,8 +1481,8 @@ void SqlAnalyzer::ProcessUpdateStmt(State& state, const UpdateStmt& stmt) {
     SDB_ASSERT(it->second);
     const auto& column = *(it->second);
     if (expr->type() == kDefaultValueTypePlaceHolderPtr) {
-      if (const auto& default_value = column.default_value) {
-        expr = ProcessExprNodeImpl(state, default_value.GetExpr());
+      if (column.expr) {
+        expr = ProcessExprNodeImpl(state, column.expr->GetExpr());
       } else {
         expr = MakeConst(velox::TypeKind::UNKNOWN, column.type);
       }
@@ -2517,7 +2516,7 @@ void SqlAnalyzer::ProcessPipelineSet(State& state, const SelectStmt& stmt) {
         }
       case SETOP_INTERSECT:
         if (stmt.all) {
-          // TODO: implement, I'm also not sure that current intersect isn't all
+          // TODO: implement in Axiom
           SDB_THROW(ERROR_NOT_IMPLEMENTED,
                     "INTERSECT ALL is not implemented yet");
         } else {
@@ -2525,7 +2524,7 @@ void SqlAnalyzer::ProcessPipelineSet(State& state, const SelectStmt& stmt) {
         }
       case SETOP_EXCEPT:
         if (stmt.all) {
-          // TODO: implement, I'm also not sure that current except isn't all
+          // TODO: implement in Axiom
           SDB_THROW(ERROR_NOT_IMPLEMENTED, "EXCEPT ALL is not implemented yet");
         } else {
           return lp::SetOperation::kExcept;
