@@ -44,6 +44,7 @@ SereneDBConnectorTableHandle::SereneDBConnectorTableHandle(
                            std::next(column_map.begin())->second)
                            ->Id();
   }
+  _txn = ExtractTransaction(session);
 }
 
 }  // namespace sdb::connector
