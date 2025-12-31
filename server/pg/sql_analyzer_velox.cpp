@@ -266,16 +266,6 @@ std::shared_ptr<const T> MakePtrView(const std::shared_ptr<const T>& ptr) {
   return MakePtrView(*ptr);
 }
 
-void AndToLeft(lp::ExprPtr& left, lp::ExprPtr right) {
-  if (!left) {
-    left = std::move(right);
-    return;
-  }
-  left = std::make_shared<lp::SpecialFormExpr>(
-    velox::BOOLEAN(), lp::SpecialForm::kAnd,
-    std::vector<lp::ExprPtr>{std::move(left), std::move(right)});
-}
-
 template<typename T>
 std::optional<T> TryGet(const A_Const& expr) {
   if (expr.isnull) {
@@ -987,6 +977,20 @@ class SqlAnalyzer {
       "presto_eq", {std::move(left), std::move(right)});
   }
 
+  lp::ExprPtr MakeAnd(std::vector<lp::ExprPtr> args) {
+    if (args.size() == 1) {
+      return std::move(args.front());
+    }
+    return ResolveVeloxFunctionAndInferArgsCommonType("and", std::move(args));
+  }
+
+  lp::ExprPtr MakeOr(std::vector<lp::ExprPtr> args) {
+    if (args.size() == 1) {
+      return std::move(args.front());
+    }
+    return ResolveVeloxFunctionAndInferArgsCommonType("or", std::move(args));
+  }
+
   ColumnRefHook GetTargetListNamingResolver(
     TargetListGetter target_list_getter);
 
@@ -1383,7 +1387,7 @@ void SqlAnalyzer::MakeTableWrite(
     auto detail = build_failing_row_detail();
 
     // make condition: if (check) -> ok; else -> fail
-    lp::ExprPtr check;
+    std::vector<lp::ExprPtr> checks;
     for (const auto& constraint : check_constraints) {
       SDB_ASSERT(constraint.expr);
       auto expr = ProcessExprNode(state, constraint.expr->GetExpr(),
@@ -1423,11 +1427,12 @@ void SqlAnalyzer::MakeTableWrite(
                                          MakeConst(true)});
       }
 
-      AndToLeft(check, std::move(expr));
+      checks.emplace_back(std::move(expr));
     }
 
-    state.root = std::make_shared<lp::FilterNode>(
-      _id_generator.NextPlanId(), std::move(state.root), std::move(check));
+    state.root = std::make_shared<lp::FilterNode>(_id_generator.NextPlanId(),
+                                                  std::move(state.root),
+                                                  MakeAnd(std::move(checks)));
   }
 
   state.root = std::make_shared<lp::TableWriteNode>(
@@ -2769,7 +2774,7 @@ void SqlAnalyzer::ProcessDistinctAll(State& state, const List* sort_clause,
     state.lookup_columns = MakePtrView(state.root->outputType());
   } else {
     // if we have an aggregation just inherit its lookup columns
-    SDB_ASSERT(state.has_aggregate);
+    SDB_ASSERT(state.has_aggregate || state.has_groupby);
   }
 
   state.has_groupby = true;
@@ -3138,7 +3143,8 @@ SqlAnalyzer::JoinUsingReturn SqlAnalyzer::ProcessJoinUsingClause(
   std::vector<lp::ExprPtr> project_exprs;
   project_names.reserve(l_output->size() + r_output->size());
   project_exprs.reserve(l_output->size() + r_output->size());
-  lp::ExprPtr join_condition;
+  std::vector<lp::ExprPtr> join_conditions;
+  join_conditions.reserve(using_list.size());
   for (const auto using_column : using_list) {
     auto l_column_idx =
       resolve_using(l_resolver, l_output, using_column, kLeft);
@@ -3154,7 +3160,7 @@ SqlAnalyzer::JoinUsingReturn SqlAnalyzer::ProcessJoinUsingClause(
     SDB_ASSERT(emplaced);
 
     auto eq = MakeEquality(std::move(l_column_ref), std::move(r_column_ref));
-    AndToLeft(join_condition, std::move(eq));
+    join_conditions.emplace_back(std::move(eq));
   }
 
   // projects as pg [common (already in vector), other_left, other_right]
@@ -3198,8 +3204,8 @@ SqlAnalyzer::JoinUsingReturn SqlAnalyzer::ProcessJoinUsingClause(
     }
   }
 
-  return JoinUsingReturn(std::move(join_condition), std::move(project_names),
-                         std::move(project_exprs));
+  return JoinUsingReturn{MakeAnd(std::move(join_conditions)),
+                         std::move(project_names), std::move(project_exprs)};
 }
 
 State SqlAnalyzer::ProcessJoinExpr(State* parent, const JoinExpr* node) {
@@ -3903,13 +3909,6 @@ lp::ExprPtr SqlAnalyzer::ProcessAExpr(State& state, const A_Expr& expr) {
     case AEXPR_NULLIF: {
       auto lhs = ProcessExprNodeImpl(state, expr.lexpr);
       auto rhs = ProcessExprNodeImpl(state, expr.rexpr);
-      // TODO: try to find common type
-      if (lhs->type() != rhs->type()) {
-        if (rhs->type()->kind() == velox::TypeKind::UNKNOWN) {
-          return lhs;
-        }
-        return MakeConst(velox::TypeKind::UNKNOWN);
-      }
       auto value = lhs;
       auto value_type = value->type();
       auto cmp = ResolveVeloxFunctionAndInferArgsCommonType(
@@ -3943,22 +3942,14 @@ lp::ExprPtr SqlAnalyzer::ProcessAExpr(State& state, const A_Expr& expr) {
       auto lhs = ProcessExprNodeImpl(state, expr.lexpr);
       auto rhs = ProcessExprListImpl(state, castNode(List, expr.rexpr));
       SDB_ASSERT(rhs.size() == 2);
-      axiom::logical_plan::ExprPtr res;
-      if (lhs->type() == velox::UNKNOWN() ||
-          rhs[0]->type() == velox::UNKNOWN() ||
-          rhs[1]->type() == velox::UNKNOWN()) {
-        // this is probably incorrect for non-deterministic lhs expressions
-        auto lhs_cmp = ResolveVeloxFunctionAndInferArgsCommonType(
-          "presto_lte", {std::move(rhs[0]), lhs});
-        auto rhs_cmp = ResolveVeloxFunctionAndInferArgsCommonType(
-          "presto_lte", {std::move(lhs), std::move(rhs[1])});
-        res = ResolveVeloxFunctionAndInferArgsCommonType(
-          "and", {std::move(lhs_cmp), std::move(rhs_cmp)});
-      } else {
-        res = ResolveVeloxFunctionAndInferArgsCommonType(
-          "presto_between",
-          {std::move(lhs), std::move(rhs[0]), std::move(rhs[1])});
-      }
+
+      // this is probably incorrect for non-deterministic lhs expressions
+      auto lhs_cmp = ResolveVeloxFunctionAndInferArgsCommonType(
+        "presto_lte", {std::move(rhs[0]), lhs});
+      auto rhs_cmp = ResolveVeloxFunctionAndInferArgsCommonType(
+        "presto_lte", {std::move(lhs), std::move(rhs[1])});
+      auto res = MakeAnd({std::move(lhs_cmp), std::move(rhs_cmp)});
+
       if (expr.kind == AEXPR_NOT_BETWEEN) {
         return ResolveVeloxFunctionAndInferArgsCommonType("presto_not",
                                                           {std::move(res)});
